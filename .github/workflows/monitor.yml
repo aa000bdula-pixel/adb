@@ -1,0 +1,35 @@
+name: SPX500 High-Frequency Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    # كل 5 دقائق من 02:00 ص إلى 12:30 ص بتوقيت السعودية (UTC+3)
+    - cron: '*/5 23 * * *'
+    - cron: '*/5 0-20 * * *'
+    - cron: '0,5,10,15,20,25,30 21 * * *'
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy requests matplotlib pytz
+
+      - name: Run main.py
+        env:
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
