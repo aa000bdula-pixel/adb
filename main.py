@@ -4,215 +4,199 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from datetime import datetime
+from datetime import datetime, time
+import pytz
+import yfinance as yf
 
-# إعدادات المتغيرات السرية من GitHub Secrets
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+# إعدادات التنبيهات
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# إعدادات المؤشر والفريم الزمني
-SYMBOL = "SPX"       # رمز مؤشر S&P 500 في Twelve Data
-INTERVAL = "1h"      # الفريم الزمني (1h للساعة، 15min لربع ساعة، 5min لخمس دقائق)
-OUTPUT_SIZE = 50     # عدد الشموع المطلوب جلبها للتحليل
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
 
 
-def fetch_market_data(symbol=SYMBOL, interval=INTERVAL, outputsize=OUTPUT_SIZE):
-    """جلب البيانات اللحظية من Twelve Data API"""
-    if not TWELVE_DATA_API_KEY:
-        raise ValueError("مفتاح TWELVE_DATA_API_KEY غير موجود في إعدادات Secrets!")
+def is_within_trading_hours():
+    saudi_tz = pytz.timezone("Asia/Riyadh")
+    now_time = datetime.now(saudi_tz).time()
+    start_time = time(2, 0)   # 2:00 AM
+    end_time = time(0, 30)    # 12:30 AM (اليوم التالي)
+    return now_time >= start_time or now_time <= end_time
 
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "format": "JSON"
-    }
 
-    response = requests.get(url, params=params, timeout=15)
-    data = response.json()
+def fetch_market_data():
+    if not is_within_trading_hours():
+        print("خارج أوقات التداول المحددة (02:00 ص - 12:30 ص بتوقيت السعودية).")
+        return pd.DataFrame()
 
-    if "values" not in data:
-        raise RuntimeError(f"خطأ في جلب البيانات من Twelve Data: {data}")
+    # جلب بيانات مؤشر S&P 500 مجاناً عبر yfinance
+    df = yf.download("^GSPC", period="5d", interval="5m", progress=False)
 
-    df = pd.DataFrame(data["values"])
+    if df is None or df.empty:
+        raise RuntimeError("فشل جلب البيانات من Yahoo Finance: البيانات فارغة.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df = df.reset_index()
+    df.rename(columns={
+        "Datetime": "datetime",
+        "Date": "datetime",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume",
+    }, inplace=True)
+
     df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
-
-    # تحويل الأعمدة السعرية إلى أرقام عشرية
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-
     return df
 
 
+def calculate_obv(df):
+    direction = np.sign(df["close"].diff()).fillna(0)
+    return (direction * df["volume"]).cumsum()
+
+
+def find_fvgs(df):
+    fvgs = []
+    for i in range(2, len(df)):
+        if df["high"].iloc[i - 2] < df["low"].iloc[i]:
+            fvgs.append(("bullish_fvg", df["high"].iloc[i - 2], df["low"].iloc[i]))
+        elif df["low"].iloc[i - 2] > df["high"].iloc[i]:
+            fvgs.append(("bearish_fvg", df["high"].iloc[i], df["low"].iloc[i - 2]))
+    return fvgs
+
+
 def detect_crt_and_fvg(df):
-    """
-    تحليل آخر الشموع لاكتشاف:
-    1. سحب السيولة (CRT - Candle Range Theory / Liquidity Sweep)
-    2. فجوة القيمة العادلة (FVG - Fair Value Gap)
-    3. حساب نسبة الاحتمالية بناءً على طول الذيل مقارنة بالجسم
-    """
-    if len(df) < 5:
+    if len(df) < 10:
         return None
 
-    # الشموع الأخيرة (نستثني الشمعة الحالية غير المغلقة [-1] ونفحص آخر شمعة مغلقة [-2] وما قبلها)
-    c_prev2 = df.iloc[-4]  # شمعة تكوين الفجوة الأولى
-    c_prev1 = df.iloc[-3]  # شمعة المرجع / السيولة
-    c_signal = df.iloc[-2] # شمعة التأكيد / سحب السيولة
+    df = df.copy()
+    df["obv"] = calculate_obv(df)
 
-    signal_type = None
-    fvg_zone = None
-    swept_level = None
+    c_prev = df.iloc[-2]
+    c_curr = df.iloc[-1]
 
-    # --- سيناريو الشراء (Bullish CRT + Bullish FVG) ---
-    # كسر قاع الشمعة السابقة ثم الإغلاق فوقه (سحب سيولة سفلي)
-    bullish_sweep = (c_signal["low"] < c_prev1["low"]) and (c_signal["close"] > c_prev1["low"])
-    # وجود فجوة صاعدة بين قمة الشمعة [-4] وقاع الشمعة [-2]
-    bullish_fvg = c_signal["low"] > c_prev2["high"]
-
-    # --- سيناريو البيع (Bearish CRT + Bearish FVG) ---
-    # كسر قمة الشمعة السابقة ثم الإغلاق تحتها (سحب سيولة علوي)
-    bearish_sweep = (c_signal["high"] > c_prev1["high"]) and (c_signal["close"] < c_prev1["high"])
-    # وجود فجوة هابطة بين قاع الشمعة [-4] وقمة الشمعة [-2]
-    bearish_fvg = c_signal["high"] < c_prev2["low"]
-
-    # حساب قوة الشمعة (نسبة الذيل إلى الجسم)
-    body = abs(c_signal["close"] - c_signal["open"])
-    total_range = c_signal["high"] - c_signal["low"]
-    if total_range == 0:
+    candle_range = c_curr["high"] - c_curr["low"]
+    if candle_range <= 0:
         return None
 
-    if bullish_sweep:
-        signal_type = "شراء (Bullish CRT)"
-        swept_level = c_prev1["low"]
-        lower_wick = min(c_signal["open"], c_signal["close"]) - c_signal["low"]
-        wick_ratio = lower_wick / total_range
-        if bullish_fvg:
-            fvg_zone = (c_prev2["high"], c_signal["low"])
+    upper_wick = c_curr["high"] - max(c_curr["open"], c_curr["close"])
+    lower_wick = min(c_curr["open"], c_curr["close"]) - c_curr["low"]
 
-    elif bearish_sweep:
-        signal_type = "بيع (Bearish CRT)"
-        swept_level = c_prev1["high"]
-        upper_wick = c_signal["high"] - max(c_signal["open"], c_signal["close"])
-        wick_ratio = upper_wick / total_range
-        if bearish_fvg:
-            fvg_zone = (c_signal["high"], c_prev2["low"])
+    bearish_div = (c_curr["high"] > df["high"].iloc[-3]) and (
+        df["obv"].iloc[-1] < df["obv"].iloc[-3]
+    )
+    bullish_div = (c_curr["low"] < df["low"].iloc[-3]) and (
+        df["obv"].iloc[-1] > df["obv"].iloc[-3]
+    )
+
+    fvgs = find_fvgs(df)
+    zone_label = "نطاق عادي"
+    for ftype, z_low, z_high in fvgs[-5:]:
+        if z_low <= c_curr["high"] and c_curr["low"] <= z_high:
+            zone_label = f"FVG ({z_low:.2f} - {z_high:.2f})"
+            break
+
+    swept_high = (
+        c_curr["high"] > c_prev["high"]
+        and c_prev["low"] <= c_curr["close"] <= c_prev["high"]
+        and c_curr["close"] < c_curr["open"]
+    )
+    swept_low = (
+        c_curr["low"] < c_prev["low"]
+        and c_prev["low"] <= c_curr["close"] <= c_prev["high"]
+        and c_curr["close"] > c_curr["open"]
+    )
+
+    saudi_tz = pytz.timezone("Asia/Riyadh")
+    dt_val = c_curr["datetime"]
+    if dt_val.tzinfo is None:
+        dt_val = pytz.utc.localize(dt_val).astimezone(saudi_tz)
     else:
-        return None
+        dt_val = dt_val.astimezone(saudi_tz)
 
-    # حساب الاحتمالية التقديرية
-    probability = min(95, int(55 + (wick_ratio * 35) + (10 if fvg_zone else 0)))
+    if swept_high:
+        prob = int(min(95, max(40, round((upper_wick / candle_range) * 100))))
+        return {
+            "signal": "CRT سلبي 🔴",
+            "prob": prob,
+            "price": float(c_curr["close"]),
+            "div": bearish_div,
+            "zone": zone_label,
+            "time": dt_val.strftime("%I:%M %p"),
+        }
 
-    return {
-        "signal": signal_type,
-        "swept_level": swept_level,
-        "fvg_zone": fvg_zone,
-        "probability": probability,
-        "price": c_signal["close"],
-        "time": c_signal["datetime"].strftime("%Y-%m-%d %H:%M")
-    }
+    if swept_low:
+        prob = int(min(95, max(40, round((lower_wick / candle_range) * 100))))
+        return {
+            "signal": "CRT إيجابي 🟢",
+            "prob": prob,
+            "price": float(c_curr["close"]),
+            "div": bullish_div,
+            "zone": zone_label,
+            "time": dt_val.strftime("%I:%M %p"),
+        }
+
+    return None
 
 
-def generate_chart(df, result, filename="spx_signal.png"):
-    """رسم آخر 6 شموع مع توضيح خط سحب السيولة ومنطقة الفجوة FVG"""
-    plot_df = df.tail(6).reset_index(drop=True)
-
+def generate_chart(df, setup):
+    sub = df.tail(10).reset_index(drop=True)
     plt.style.use("dark_background")
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
 
-    for idx, row in plot_df.iterrows():
-        color = "#26a69a" if row["close"] >= row["open"] else "#ef5350"
-        # رسم الذيل (الفتيل)
-        ax.plot([idx, idx], [row["low"], row["high"]], color=color, linewidth=1.8)
-        # رسم جسم الشمعة
-        lower = min(row["open"], row["close"])
-        height = max(abs(row["close"] - row["open"]), 0.15)
-        rect = Rectangle((idx - 0.3, lower), 0.6, height, facecolor=color, edgecolor=color)
+    for i, row in sub.iterrows():
+        color = "#2b9980" if row["close"] >= row["open"] else "#d9383a"
+        ax.plot([i, i], [row["low"], row["high"]], color=color, linewidth=1.2)
+        body_low = min(row["open"], row["close"])
+        body_h = max(abs(row["close"] - row["open"]), 1e-4)
+        rect = Rectangle(
+            (i - 0.3, body_low), 0.6, body_h, facecolor=color, edgecolor=color
+        )
         ax.add_patch(rect)
 
-    # رسم خط مستوى السيولة المسحوبة (CRT)
-    ax.axhline(
-        result["swept_level"],
-        color="#ffca28",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"CRT Liquidity Sweep: {result['swept_level']:.2f}"
-    )
-
-    # رسم منطقة الفجوة السعرية (FVG) إن وجدت
-    if result["fvg_zone"]:
-        low_fvg, high_fvg = result["fvg_zone"]
-        ax.axhspan(
-            low_fvg,
-            high_fvg,
-            color="#42a5f5",
-            alpha=0.25,
-            label=f"FVG Zone: {low_fvg:.2f} - {high_fvg:.2f}"
-        )
-
-    ax.set_xticks(range(len(plot_df)))
-    ax.set_xticklabels(plot_df["datetime"].dt.strftime("%H:%M"), fontsize=9)
     ax.set_title(
-        f"S&P 500 ({INTERVAL}) | {result['signal']} | Prob: {result['probability']}%",
-        fontsize=12,
-        fontweight="bold",
-        pad=12
+        f"S&P 500 | {setup['signal']} | Prob: {setup['prob']}%", color="white"
     )
-    ax.grid(True, linestyle=":", alpha=0.3)
-    ax.legend(loc="upper left", fontsize=9)
-
     plt.tight_layout()
-    plt.savefig(filename, dpi=150)
+    plt.savefig("chart.png", dpi=150)
     plt.close()
-    return filename
 
 
-def send_telegram_alert(image_path, result):
-    """إرسال صورة الشارت مع تفاصيل الإشارة إلى تليجرام"""
+def send_telegram_alert(setup):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("بيانات تليجرام غير مكتملة، تم تخطي الإرسال.")
+        print("إعدادات تيليجرام غير مكتملة.")
         return
 
-    fvg_text = (
-        f"{result['fvg_zone'][0]:.2f} - {result['fvg_zone'][1]:.2f}"
-        if result["fvg_zone"]
-        else "لا توجد فجوة مكتملة"
-    )
-
+    div_text = "نعم ✅" if setup.get("div") else "لا ❌"
     caption = (
-        f"🚨 **تنبيه S&P 500 ({INTERVAL})**\n\n"
-        f"📌 **الاتجاه:** {result['signal']}\n"
-        f"💰 **سعر الإغلاق:** {result['price']:.2f}\n"
-        f"🎯 **مستوى السيولة (CRT):** {result['swept_level']:.2f}\n"
-        f"📊 **منطقة الفجوة (FVG):** {fvg_text}\n"
-        f"🔥 **نسبة الاحتمالية:** {result['probability']}%\n"
-        f"🕒 **الوقت:** {result['time']}"
+        f"🚨 {setup['signal']}\n"
+        f"💰 السعر: {setup['price']:.2f}\n"
+        f"📊 المنطقة: {setup['zone']}\n"
+        f"📉 دايفرجنس OBV: {div_text}\n"
+        f"🔥 الاحتمالية: {setup['prob']}%\n"
+        f"🕒 الوقت: {setup['time']}"
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    with open(image_path, "rb") as photo:
-        files = {"photo": photo}
-        data = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "caption": caption,
-            "parse_mode": "Markdown"
-        }
-        res = requests.post(url, data=data, files=files, timeout=15)
-        print("حالة إرسال تليجرام:", res.status_code, res.text)
+    with open("chart.png", "rb") as photo:
+        response = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files={"photo": photo},
+            timeout=20,
+        )
+        response.raise_for_status()
 
 
 if __name__ == "__main__":
-    print("جاري جلب البيانات اللحظية لـ S&P 500...")
     df = fetch_market_data()
-    print(f"تم جلب {len(df)} شمعة بنجاح. آخر سعر إغلاق: {df.iloc[-1]['close']}")
-
-    signal_result = detect_crt_and_fvg(df)
-    if signal_result:
-        print("تم رصد إشارة:", signal_result)
-        chart_file = generate_chart(df, signal_result)
-        send_telegram_alert(chart_file, signal_result)
-    else:
-        print("لا توجد إشارة CRT مكتملة في الشمعة الأخيرة حالياً.")
+    if not df.empty:
+        setup = detect_crt_and_fvg(df)
+        if setup:
+            generate_chart(df, setup)
+            send_telegram_alert(setup)
+            print("تم إرسال التنبيه بنجاح.")
+        else:
+            print("لا توجد إشارة مطابقة حالياً.")
